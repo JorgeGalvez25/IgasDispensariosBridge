@@ -23,7 +23,8 @@ type
     rutaLog:string;
     folio:Integer;
     rootJSON: TlkJSONobject;
-    horaAct: TDateTime;
+    horaAct, horaArranque: TDateTime;
+    version:string;
     function GetServiceController: TServiceController; override;
     procedure AddPeticion(valor:string; comando:string; socket:TCustomWinSocket);
     procedure AgregaLogOG(lin: string);
@@ -199,9 +200,11 @@ var
 begin
   try
     config:= TIniFile.Create(ExtractFilePath(ParamStr(0)) +'PDispBridge.ini');
-    rutaLog:=config.ReadString('CONF','RutaLog','C:\ImagenCo');
+    rutaLog:=config.ReadString('CONF','RutaLog','C:\OpenGas\Logs');
     SSocketOG.Port:=config.ReadInteger('CONF','PuertoOG',1001);
-    SSocketPDisp.Port:=config.ReadInteger('CONF','PuertoPDisp',1003);
+    SSocketPDisp.Port:=config.ReadInteger('CONF','PuertoPDisp',1004);
+    horaArranque:=Now;
+    version:='4af6278040034b3746f511b9428a910c4db50c44';
     ListaLogOG:=TStringList.Create;
     ListaLogPDisp:=TStringList.Create;
     rootJSON:=TlkJSONObject.Create;
@@ -225,7 +228,7 @@ end;
 procedure Togcvdispensarios_bridge.SSocketOGClientRead(
   Sender: TObject; Socket: TCustomWinSocket);
   var
-    mensaje,comando,parametro, checksum:string;
+    mensaje,comando,checksum:string;
     i:Integer;
     chks_valido:Boolean;
 begin
@@ -360,6 +363,8 @@ function Togcvdispensarios_bridge.ObtenerEstado:String;
 var
   n:TlkJSONbase;
 begin
+  Result:='DISPENSERS|STATE|False|';
+
   if rootJSON = nil then
     Exit;
 
@@ -373,7 +378,7 @@ begin
   if Assigned(n) then
     Result:='DISPENSERS|STATE|True|'+IntToStr(rootJSON.Field['Estado'].Value)+'|'
   else
-    Result:='DISPENSERS|STATE|True|-1|';
+    Result:='DISPENSERS|STATE|False|';
 end;
 
 function Togcvdispensarios_bridge.ObtenerEstadoPosiciones(xpos:Integer):string;
@@ -385,6 +390,8 @@ var
   AEstados    : string;
 begin
   try
+    Result:='DISPENSERS|STATUS|False|';
+
     if rootJSON = nil then
       Exit;
 
@@ -424,6 +431,8 @@ var
   i           : Integer;
 
 begin
+  Result:='DISPENSERS|TRANSACTION|False|';
+
   if xpos<=0 then
     Exit;
 
@@ -451,6 +460,8 @@ end;
 
 procedure Togcvdispensarios_bridge.GuardaLogOG;
 begin
+  AgregaLogOG('Version: '+version);
+  AgregaLogOG('Fecha y hora de arranque: '+FechaHoraExtToStr(horaArranque));
   ListaLogOG.SaveToFile(rutaLog+'\LogOG'+FiltraStrNum(FechaHoraToStr(Now))+'.txt');
 end;
 
@@ -458,7 +469,6 @@ procedure Togcvdispensarios_bridge.SSocketPDispClientRead(Sender: TObject;
   Socket: TCustomWinSocket);
 var
   respTxt   : string;
-  folioResp : Integer;
   p : TPeticion;
 begin
   try
@@ -499,7 +509,7 @@ procedure Togcvdispensarios_bridge.ProcesaRespuestasJSON(
 var
   jArray    : TlkJSONbase;
   jItem     : TlkJSONbase;
-  i, Folio  : Integer;
+  i, folioResp  : Integer;
   Resultado : string;
   p : TPeticion;
 begin
@@ -516,10 +526,10 @@ begin
     begin
       jItem := jArray.Child[i];
 
-      Folio     := jItem.Field['Folio'].Value;
+      folioResp     := jItem.Field['Folio'].Value;
       Resultado := jItem.Field['Resultado'].Value;
 
-      if ListaPeticiones.TryLocateByFolio(Folio, p) then
+      if ListaPeticiones.TryLocateByFolio(folioResp, p) then
       begin
         ResponderOG('DISPENSERS|' + p.Comando + '|' + Resultado, p.CliSock);
         ListaPeticiones.Remove(p);
@@ -535,6 +545,8 @@ end;
 
 procedure Togcvdispensarios_bridge.GuardaLogPDisp;
 begin
+  AgregaLogPDisp('Version: '+version);
+  AgregaLogPDisp('Fecha y hora de arranque: '+FechaHoraExtToStr(horaArranque));
   ListaLogPDisp.SaveToFile(rutaLog+'\LogPDisp'+FiltraStrNum(FechaHoraToStr(Now))+'.txt');
 end;
 

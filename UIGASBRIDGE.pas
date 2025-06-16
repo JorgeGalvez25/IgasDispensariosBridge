@@ -23,8 +23,9 @@ type
     rutaLog:string;
     folio:Integer;
     rootJSON: TlkJSONobject;
-    horaAct, horaArranque: TDateTime;
+    horaAct, horaArranque, horaLog: TDateTime;
     version:string;
+    minutosLog:Integer;
     function GetServiceController: TServiceController; override;
     procedure AddPeticion(valor:string; comando:string; socket:TCustomWinSocket);
     procedure AgregaLogOG(lin: string);
@@ -63,7 +64,6 @@ type
     procedure  Push(APeticion: TPeticion);
     function  TryPeek(out APeticion: TPeticion;
                       MaxTries: Integer = 2): Boolean;
-    function   IsEmpty: Boolean;
     function TryLocateByFolio(AFol: Integer; out APet: TPeticion): Boolean;
     procedure Remove(APeticion: TPeticion; AFree: Boolean = True);
   end;
@@ -153,16 +153,6 @@ begin
   end;
 end;
 
-function TPeticionQueue.IsEmpty: Boolean;
-begin
-  EnterCriticalSection(FCS);
-  try
-    Result := FList.Count = 0;
-  finally
-    LeaveCriticalSection(FCS);
-  end;
-end;
-
 procedure TPeticionQueue.Remove(APeticion: TPeticion; AFree: Boolean = True);
 var
   Idx : Integer;
@@ -203,7 +193,9 @@ begin
     rutaLog:=config.ReadString('CONF','RutaLog','C:\OpenGas\Logs');
     SSocketOG.Port:=config.ReadInteger('CONF','PuertoOG',1001);
     SSocketPDisp.Port:=config.ReadInteger('CONF','PuertoPDisp',1004);
+    minutosLog:=StrToInt(config.ReadString('CONF','MinutosLog','0'));
     horaArranque:=Now;
+    horaLog:=Now;
     version:='4af6278040034b3746f511b9428a910c4db50c44';
     ListaLogOG:=TStringList.Create;
     ListaLogPDisp:=TStringList.Create;
@@ -235,6 +227,11 @@ begin
   try
     mensaje:=Socket.ReceiveText;
     AgregaLogOG('R '+mensaje);
+
+    if (minutosLog>0) and (MinutesBetween(Now,horaLog)>=minutosLog) then begin
+      GuardaLogOG;
+      GuardaLogPDisp;
+    end;
 
     for i:=1 to Length(mensaje) do begin
       if mensaje[i]=#2 then begin
@@ -460,6 +457,7 @@ end;
 
 procedure Togcvdispensarios_bridge.GuardaLogOG;
 begin
+  horaLog:=Now;
   AgregaLogOG('Version: '+version);
   AgregaLogOG('Fecha y hora de arranque: '+FechaHoraExtToStr(horaArranque));
   ListaLogOG.SaveToFile(rutaLog+'\LogOG'+FiltraStrNum(FechaHoraToStr(Now))+'.txt');
@@ -545,6 +543,7 @@ end;
 
 procedure Togcvdispensarios_bridge.GuardaLogPDisp;
 begin
+  horaLog:=Now;
   AgregaLogPDisp('Version: '+version);
   AgregaLogPDisp('Fecha y hora de arranque: '+FechaHoraExtToStr(horaArranque));
   ListaLogPDisp.SaveToFile(rutaLog+'\LogPDisp'+FiltraStrNum(FechaHoraToStr(Now))+'.txt');

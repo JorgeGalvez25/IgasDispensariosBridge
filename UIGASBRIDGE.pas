@@ -23,8 +23,9 @@ type
     rutaLog:string;
     folio:Integer;
     rootJSON: TlkJSONobject;
-    horaAct, horaArranque, horaLog: TDateTime;
+    horaAct, horaArranque, horaLog, horaPeticion: TDateTime;
     version:string;
+    cmdAnt:string;
     minutosLog:Integer;
     function GetServiceController: TServiceController; override;
     procedure AddPeticion(valor:string; comando:string; socket:TCustomWinSocket);
@@ -41,7 +42,7 @@ type
     { Public declarations }
   end;
 
-type TMetodos = (STATUS_e, TRANSACTION_e, TOTALS_e, STATE_e);
+type TMetodos = (STATUS_e, TRANSACTION_e, TOTALS_e, STATE_e, PRICES_e, AUTHORIZE_e, PAYMENT_e, TRACE_e);
 
 type
   TPeticion = class
@@ -63,8 +64,9 @@ type
 
     procedure  Push(APeticion: TPeticion);
     function  TryPeek(out APeticion: TPeticion;
-                      MaxTries: Integer = 2): Boolean;
+                      MaxTries: Integer = 3): Boolean;
     function TryLocateByFolio(AFol: Integer; out APet: TPeticion): Boolean;
+    function TryLocateByTipo(ATipo: string; out APet: TPeticion): Boolean;
     procedure Remove(APeticion: TPeticion; AFree: Boolean = True);
   end;
 
@@ -103,7 +105,7 @@ begin
 end;
 
 function TPeticionQueue.TryPeek(out APeticion: TPeticion;
-                                MaxTries: Integer = 2): Boolean;
+                                MaxTries: Integer = 3): Boolean;
 var
   Tmp : TPeticion;
 begin
@@ -142,6 +144,26 @@ begin
   try
     for i := 0 to FList.Count - 1 do
       if TPeticion(FList[i]).Folio = AFol then
+      begin
+        APet  := TPeticion(FList[i]);
+        Result := True;
+        Exit;
+      end;
+    Result := False;
+  finally
+    LeaveCriticalSection(FCS);
+  end;
+end;
+
+function TPeticionQueue.TryLocateByTipo(ATipo: string; out APet: TPeticion): Boolean;
+var
+  i: Integer;
+begin
+  APet := nil;
+  EnterCriticalSection(FCS);
+  try
+    for i := 0 to FList.Count - 1 do
+      if (TPeticion(FList[i]).Comando = ATipo) and (TPeticion(FList[i]).Tries>0) then
       begin
         APet  := TPeticion(FList[i]);
         Result := True;
@@ -196,13 +218,13 @@ begin
     minutosLog:=StrToInt(config.ReadString('CONF','MinutosLog','0'));
     horaArranque:=Now;
     horaLog:=Now;
-    version:='4af6278040034b3746f511b9428a910c4db50c44';
+    version:='4941970710dc8f70c55306030d6c246851955fba';
     ListaLogOG:=TStringList.Create;
     ListaLogPDisp:=TStringList.Create;
     rootJSON:=TlkJSONObject.Create;
     ListaPeticiones:=TPeticionQueue.Create;
 
-    SSocketOG.Active:=True;
+    SSocketOG.Active:=False;
     SSocketPDisp.Active:=True;
 
     while not Terminated do
@@ -226,6 +248,12 @@ procedure Togcvdispensarios_bridge.SSocketOGClientRead(
 begin
   try
     mensaje:=Socket.ReceiveText;
+
+    if (Length(mensaje)=1) and (StrToIntDef(mensaje,-99) in [0,1]) then begin
+      AddPeticion(mensaje,'1',Socket);
+      Exit;
+    end;
+
     AgregaLogOG('R '+mensaje);
 
     if (minutosLog>0) and (MinutesBetween(Now,horaLog)>=minutosLog) then begin
@@ -252,14 +280,14 @@ begin
     if mensaje[Length(mensaje)]='|' then
       Delete(mensaje,Length(mensaje),1);
     if NoElemStrSep(mensaje,'|')>=2 then begin
-      if UpperCase(ExtraeElemStrSep(mensaje,1,'|'))<>'DISPENSERS' then begin
+      if UpperCase(Copy(ExtraeElemStrSep(mensaje,1,'|'),1,10))<>'DISPENSERS' then begin
         ResponderOG('DISPENSERS|False|Este servicio solo procesa solicitudes de dispensarios|',Socket);
         Exit;
       end;
 
       comando:=UpperCase(ExtraeElemStrSep(mensaje,2,'|'));
 
-      if not chks_valido then begin
+      if (not chks_valido) and (ExtraeElemStrSep(mensaje,1,'|')<>'DISPENSERSX') then begin
         ResponderOG('DISPENSERS|'+comando+'|False|Checksum invalido|',Socket);
         Exit;
       end;
@@ -282,30 +310,47 @@ var
   metodoEnum:TMetodos;
   p:TPeticion;
 begin
-  metodoEnum := TMetodos(GetEnumValue(TypeInfo(TMetodos), comando+'_e'));
+  try
+    metodoEnum := TMetodos(GetEnumValue(TypeInfo(TMetodos), comando+'_e'));
 
-  case metodoEnum of
-    STATE_e:
-      ResponderOG(ObtenerEstado,socket);
-    STATUS_e:
-      ResponderOG(ObtenerEstadoPosiciones(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
-    TRANSACTION_e:
-      ResponderOG(ObtenerTranPosCarga(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
-  else
-    inc(folio);
-    if folio>999 then
-      folio:=1;
+    case metodoEnum of
+      STATE_e:
+        ResponderOG(ObtenerEstado,socket);
+      STATUS_e:
+        ResponderOG(ObtenerEstadoPosiciones(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
+      TRANSACTION_e:
+        ResponderOG(ObtenerTranPosCarga(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
+    else
+      if (comando<>cmdAnt) or (MilliSecondsBetween(Now, horaPeticion)>=5) then begin
+        inc(folio);
+        if folio>999 then
+          folio:=1;
 
-    p:=TPeticion.Create;
-    p.Folio:=folio;
-    p.Comando:=comando;
-    p.Peticion:=valor;
-    p.CliSock:=socket;
-    ListaPeticiones.Push(p);
-    if comando='TRACE' then begin
-      GuardaLogOG;
-      GuardaLogPDisp;
+        p:=TPeticion.Create;
+        p.Folio:=folio;
+        p.Comando:=comando;
+        p.Peticion:=valor;
+        p.CliSock:=socket;
+        ListaPeticiones.Push(p);
+        cmdAnt:=comando;
+        horaPeticion:=Now;
+      end;
+
+      if metodoEnum=PRICES_e then
+        ResponderOG('DISPENSERS|PRICES|True|0|', socket)
+      else if metodoEnum=AUTHORIZE_e then
+        ResponderOG('DISPENSERS|AUTHORIZE|True|0|', socket)
+      else if metodoEnum=PAYMENT_e then
+        ResponderOG('DISPENSERS|PAYMENT|True|0|', socket);
+
+      if metodoEnum=TRACE_e then begin
+        GuardaLogOG;
+        GuardaLogPDisp;                                       
+      end;
     end;
+  finally
+    if SecondsBetween(Now, horaAct)>=2 then
+      SSocketOG.Active:=False;
   end;
 end;
 
@@ -345,13 +390,24 @@ end;
 
 procedure Togcvdispensarios_bridge.ResponderOG(resp: string; socket:TCustomWinSocket);
 begin
-  try
-    AgregaLogOG('E '+#1#2+resp+#3+CRC16(resp)+#23);
-    socket.SendText(#1#2+resp+#3+CRC16(resp)+#23);
-  except
-    on e:Exception do begin
-      AgregaLogOG('Error ResponderOG: '+e.Message);
-      ListaLogOG.SaveToFile(rutaLog+'\LogOG'+FiltraStrNum(FechaHoraToStr(Now))+'.txt');
+  begin
+    try
+      if (socket = nil) or (not socket.Connected) then begin
+        AgregaLogOG('ResponderOG: socket no disponible');
+        Exit;
+      end;
+
+      if Length(resp) > 1 then begin
+        AgregaLogOG('E ' + #1#2 + resp + #3 + CRC16(resp) + #23);
+        socket.SendText(#1#2 + resp + #3 + CRC16(resp) + #23);
+      end
+      else
+        socket.SendText(resp);
+    except
+      on e: Exception do begin
+        AgregaLogOG('Error ResponderOG: ' + e.Message);
+        ListaLogOG.SaveToFile(rutaLog + '\LogOG' + FiltraStrNum(FechaHoraToStr(Now)) + '.txt');
+      end;
     end;
   end;
 end;
@@ -364,11 +420,6 @@ begin
 
   if rootJSON = nil then
     Exit;
-
-  if SecondsBetween(Now, horaAct)>=2 then begin
-    SSocketOG.Active:=False;
-    Exit;
-  end;
 
   n:=rootJSON.Field['Estado'];
 
@@ -470,6 +521,7 @@ var
   p : TPeticion;
 begin
   try
+    horaAct:=Now;
     respTxt := Socket.ReceiveText;
     AgregaLogPDisp('R '+respTxt);
     if not SSocketOG.Active then
@@ -487,7 +539,7 @@ begin
     Socket.SendText('0|NOTHING');
   except
     on e:Exception do begin
-      AgregaLogPDisp('Error SSocketPDispClientRead :'+e.Message);
+      AgregaLogPDisp('Error SSocketPDispClientRead: '+e.Message);
       GuardaLogPDisp;
     end;
   end;
@@ -514,7 +566,6 @@ begin
   if Assigned(rootJSON) then
     rootJSON.Free;
   rootJSON := TlkJSONobject(TlkJSON.ParseText(ATexto));
-  horaAct:=Now;
   try
     jArray := rootJSON.Field['Peticiones'];
     if not (jArray is TlkJSONlist) then
@@ -529,9 +580,19 @@ begin
 
       if ListaPeticiones.TryLocateByFolio(folioResp, p) then
       begin
-        ResponderOG('DISPENSERS|' + p.Comando + '|' + Resultado, p.CliSock);
+        if p.Comando='1' then
+          ResponderOG(Resultado, p.CliSock)
+        else
+          ResponderOG('DISPENSERS|' + p.Comando + '|' + Resultado, p.CliSock);
         ListaPeticiones.Remove(p);
       end;
+
+      if ListaPeticiones.TryLocateByTipo('PRICES', p) then
+        ListaPeticiones.Remove(p);
+      if ListaPeticiones.TryLocateByTipo('AUTHORIZE', p) then
+        ListaPeticiones.Remove(p);
+      if ListaPeticiones.TryLocateByTipo('PAYMENT', p) then
+        ListaPeticiones.Remove(p);
     end;
   except
     on e:Exception do begin

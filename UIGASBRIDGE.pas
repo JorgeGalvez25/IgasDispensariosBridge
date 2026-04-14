@@ -68,6 +68,7 @@ type
     function TryLocateByFolio(AFol: Integer; out APet: TPeticion): Boolean;
     function TryLocateByTipo(ATipo: string; out APet: TPeticion): Boolean;
     procedure Remove(APeticion: TPeticion; AFree: Boolean = True);
+    procedure Clear;
   end;
 
 var
@@ -191,6 +192,19 @@ begin
       if AFree then
         APeticion.Free;
     end;
+  finally
+    LeaveCriticalSection(FCS);
+  end;
+end;
+
+procedure TPeticionQueue.Clear;
+var i: Integer;
+begin
+  EnterCriticalSection(FCS);
+  try
+    for i := FList.Count - 1 downto 0 do
+      TPeticion(FList[i]).Free;
+    FList.Clear;
   finally
     LeaveCriticalSection(FCS);
   end;
@@ -349,8 +363,10 @@ begin
       end;
     end;
   finally
-    if SecondsBetween(Now, horaAct)>=2 then
+    if SecondsBetween(Now, horaAct)>=2 then begin
+      ListaPeticiones.Clear;
       SSocketOG.Active:=False;
+    end;
   end;
 end;
 
@@ -389,25 +405,38 @@ begin
 end;
 
 procedure Togcvdispensarios_bridge.ResponderOG(resp: string; socket:TCustomWinSocket);
+var i: Integer;
+    socketValido: Boolean;
 begin
-  begin
-    try
-      if (socket = nil) or (not socket.Connected) then begin
-        AgregaLogOG('ResponderOG: socket no disponible');
-        Exit;
-      end;
+  try
+    if (socket = nil) then begin
+      AgregaLogOG('ResponderOG: socket nil');
+      Exit;
+    end;
 
-      if Length(resp) > 1 then begin
-        AgregaLogOG('E ' + #1#2 + resp + #3 + CRC16(resp) + #23);
-        socket.SendText(#1#2 + resp + #3 + CRC16(resp) + #23);
-      end
-      else
-        socket.SendText(resp);
-    except
-      on e: Exception do begin
-        AgregaLogOG('Error ResponderOG: ' + e.Message);
-        ListaLogOG.SaveToFile(rutaLog + '\LogOG' + FiltraStrNum(FechaHoraToStr(Now)) + '.txt');
+    socketValido := False;
+    for i := 0 to SSocketOG.Socket.ActiveConnections - 1 do begin
+      if SSocketOG.Socket.Connections[i] = socket then begin
+        socketValido := True;
+        Break;
       end;
+    end;
+
+    if not socketValido then begin
+      AgregaLogOG('ResponderOG: socket ya no activo');
+      Exit;
+    end;
+
+    if Length(resp) > 1 then begin
+      AgregaLogOG('E ' + #1#2 + resp + #3 + CRC16(resp) + #23);
+      socket.SendText(#1#2 + resp + #3 + CRC16(resp) + #23);
+    end
+    else
+      socket.SendText(resp);
+  except
+    on e: Exception do begin
+      AgregaLogOG('Error ResponderOG: ' + e.Message);
+      ListaLogOG.SaveToFile(rutaLog + '\LogOG' + FiltraStrNum(FechaHoraToStr(Now)) + '.txt');
     end;
   end;
 end;

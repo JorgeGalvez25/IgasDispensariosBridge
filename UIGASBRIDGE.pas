@@ -10,13 +10,16 @@ type
   Togcvdispensarios_bridge = class(TService)
     SSocketOG: TServerSocket;
     SSocketPDisp: TServerSocket;
+    TimerTimeout: TTimer;
     procedure ServiceExecute(Sender: TService);
     procedure SSocketOGClientRead(Sender: TObject;
       Socket: TCustomWinSocket);
     procedure SSocketPDispClientRead(Sender: TObject;
       Socket: TCustomWinSocket);
+    procedure TimerTimeoutTimer(Sender: TObject);
   private
     { Private declarations }
+    TimeoutRespSrv: Integer;
   public
     ListaLogOG:TStringList;
     ListaLogPDisp:TStringList;
@@ -51,6 +54,7 @@ type
     Peticion : string;
     Tries    : Integer;
     CliSock  : TCustomWinSocket;
+    HoraEnvio: TDateTime;
   end;
 
   TPeticionQueue = class
@@ -68,6 +72,7 @@ type
     function TryLocateByFolio(AFol: Integer; out APet: TPeticion): Boolean;
     function TryLocateByTipo(ATipo: string; out APet: TPeticion): Boolean;
     procedure Remove(APeticion: TPeticion; AFree: Boolean = True);
+    function  TryPopExpired(TimeoutSeg: Integer; out APeticion: TPeticion): Boolean;
     procedure Clear;
   end;
 
@@ -210,6 +215,33 @@ begin
   end;
 end;
 
+function TPeticionQueue.TryPopExpired(TimeoutSeg: Integer;
+  out APeticion: TPeticion): Boolean;
+var
+  Tmp: TPeticion;
+begin
+  APeticion := nil;
+  Result := False;
+  if TimeoutSeg <= 0 then Exit;
+
+  EnterCriticalSection(FCS);
+  try
+    if FList.Count > 0 then begin
+      Tmp := TPeticion(FList[0]);
+      { Solo aplica a peticiones que ya fueron enviadas por socket }
+      if (Tmp.HoraEnvio > 0) and
+         (SecondsBetween(Now, Tmp.HoraEnvio) >= TimeoutSeg) then
+      begin
+        FList.Delete(0);  { extraer de la cola sin Free }
+        APeticion := Tmp;
+        Result := True;
+      end;
+    end;
+  finally
+    LeaveCriticalSection(FCS);
+  end;
+end;
+
 procedure ServiceController(CtrlCode: DWord); stdcall;
 begin
   ogcvdispensarios_bridge.Controller(CtrlCode);
@@ -230,6 +262,7 @@ begin
     SSocketOG.Port:=config.ReadInteger('CONF','PuertoOG',1001);
     SSocketPDisp.Port:=config.ReadInteger('CONF','PuertoPDisp',1004);
     minutosLog:=StrToInt(config.ReadString('CONF','MinutosLog','0'));
+    TimeoutRespSrv:=config.ReadInteger('CONF','TimeoutRespSrv',2);
     horaArranque:=Now;
     horaLog:=Now;
     version:='4941970710dc8f70c55306030d6c246851955fba';
@@ -238,11 +271,15 @@ begin
     rootJSON:=TlkJSONObject.Create;
     ListaPeticiones:=TPeticionQueue.Create;
 
+    TimerTimeout.Enabled:=True;
+
     SSocketOG.Active:=False;
     SSocketPDisp.Active:=True;
 
     while not Terminated do
       ServiceThread.ProcessRequests(True);
+    TimerTimeout.Enabled:=False;
+    TimerTimeout.Free;
     SSocketOG.Active := False;
     SSocketPDisp.Active := False;
   except
@@ -345,6 +382,7 @@ begin
         p.Comando:=comando;
         p.Peticion:=valor;
         p.CliSock:=socket;
+        p.HoraEnvio:=0;
         ListaPeticiones.Push(p);
         cmdAnt:=comando;
         horaPeticion:=Now;
@@ -559,6 +597,9 @@ begin
       ProcesaRespuestasJSON(respTxt);
 
     if ListaPeticiones.TryPeek(p) then begin
+      { Estampar hora de envio en el primer envio }
+      if p.HoraEnvio = 0 then
+        p.HoraEnvio := Now;
       AgregaLogPDisp('E '+IntToStr(p.Folio)+'|'+p.Peticion);
       Socket.SendText(IntToStr(p.Folio)+'|'+p.Peticion);
       Exit;
@@ -637,6 +678,32 @@ begin
   AgregaLogPDisp('Version: '+version);
   AgregaLogPDisp('Fecha y hora de arranque: '+FechaHoraExtToStr(horaArranque));
   ListaLogPDisp.SaveToFile(rutaLog+'\LogPDisp'+FiltraStrNum(FechaHoraToStr(Now))+'.txt');
+end;
+
+procedure Togcvdispensarios_bridge.TimerTimeoutTimer(Sender: TObject);
+var
+  p: TPeticion;
+begin
+  if TimeoutRespSrv <= 0 then Exit;
+  try
+    while ListaPeticiones.TryPopExpired(TimeoutRespSrv, p) do begin
+      AgregaLogPDisp('TIMEOUT peticion [' + IntToStr(p.Folio) + ']: '
+        + p.Comando + ' - Sin respuesta en ' + IntToStr(TimeoutRespSrv) + 's');
+      try
+        if p.Comando = '1' then
+          ResponderOG('False|Timeout sin respuesta del servicio|', p.CliSock)
+        else
+          ResponderOG('DISPENSERS|' + p.Comando + '|False|Timeout sin respuesta del servicio|', p.CliSock);
+      except
+        on e: Exception do
+          AgregaLogPDisp('Error respondiendo timeout: ' + e.Message);
+      end;
+      p.Free;
+    end;
+  except
+    on e: Exception do
+      AgregaLogPDisp('Error TimerTimeoutTimer: ' + e.Message);
+  end;
 end;
 
 end.

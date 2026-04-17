@@ -228,11 +228,9 @@ begin
   try
     if FList.Count > 0 then begin
       Tmp := TPeticion(FList[0]);
-      { Solo aplica a peticiones que ya fueron enviadas por socket }
-      if (Tmp.HoraEnvio > 0) and
-         (SecondsBetween(Now, Tmp.HoraEnvio) >= TimeoutSeg) then
+      if (SecondsBetween(Now, Tmp.HoraEnvio) >= TimeoutSeg) then
       begin
-        FList.Delete(0);  { extraer de la cola sin Free }
+        FList.Delete(0);
         APeticion := Tmp;
         Result := True;
       end;
@@ -271,6 +269,9 @@ begin
     rootJSON:=TlkJSONObject.Create;
     ListaPeticiones:=TPeticionQueue.Create;
 
+    TimerTimeout:=TTimer.Create(Self);
+    TimerTimeout.Interval:=500;
+    TimerTimeout.OnTimer:=TimerTimeoutTimer;
     TimerTimeout.Enabled:=True;
 
     SSocketOG.Active:=False;
@@ -382,7 +383,7 @@ begin
         p.Comando:=comando;
         p.Peticion:=valor;
         p.CliSock:=socket;
-        p.HoraEnvio:=0;
+        p.HoraEnvio:=Now;
         ListaPeticiones.Push(p);
         cmdAnt:=comando;
         horaPeticion:=Now;
@@ -597,9 +598,6 @@ begin
       ProcesaRespuestasJSON(respTxt);
 
     if ListaPeticiones.TryPeek(p) then begin
-      { Estampar hora de envio en el primer envio }
-      if p.HoraEnvio = 0 then
-        p.HoraEnvio := Now;
       AgregaLogPDisp('E '+IntToStr(p.Folio)+'|'+p.Peticion);
       Socket.SendText(IntToStr(p.Folio)+'|'+p.Peticion);
       Exit;
@@ -684,16 +682,17 @@ procedure Togcvdispensarios_bridge.TimerTimeoutTimer(Sender: TObject);
 var
   p: TPeticion;
 begin
-  if TimeoutRespSrv <= 0 then Exit;
   try
     while ListaPeticiones.TryPopExpired(TimeoutRespSrv, p) do begin
-      AgregaLogPDisp('TIMEOUT peticion [' + IntToStr(p.Folio) + ']: '
-        + p.Comando + ' - Sin respuesta en ' + IntToStr(TimeoutRespSrv) + 's');
+      AgregaLogOG('TIMEOUT [' + IntToStr(p.Folio) + ']: '
+        + p.Comando + ' - ' + IntToStr(TimeoutRespSrv) + 's sin respuesta de Wayne2W');
+      AgregaLogPDisp('TIMEOUT [' + IntToStr(p.Folio) + ']: '
+        + p.Comando + ' - ' + IntToStr(TimeoutRespSrv) + 's sin respuesta de Wayne2W');
       try
         if p.Comando = '1' then
-          ResponderOG('False|Timeout sin respuesta del servicio|', p.CliSock)
+          ResponderOG('False|Timeout excedido con Pdispensarios|', p.CliSock)
         else
-          ResponderOG('DISPENSERS|' + p.Comando + '|False|Timeout sin respuesta del servicio|', p.CliSock);
+          ResponderOG('DISPENSERS|' + p.Comando + '|False|Timeout excedido con Pdispensarios|', p.CliSock);
       except
         on e: Exception do
           AgregaLogPDisp('Error respondiendo timeout: ' + e.Message);

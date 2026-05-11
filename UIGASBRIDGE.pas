@@ -10,7 +10,6 @@ type
   Togcvdispensarios_bridge = class(TService)
     SSocketOG: TServerSocket;
     SSocketPDisp: TServerSocket;
-    TimerTimeout: TTimer;
     procedure ServiceExecute(Sender: TService);
     procedure SSocketOGClientRead(Sender: TObject;
       Socket: TCustomWinSocket);
@@ -20,6 +19,7 @@ type
   private
     { Private declarations }
     TimeoutRespSrv: Integer;
+    TimerTimeout: TTimer;
   public
     ListaLogOG:TStringList;
     ListaLogPDisp:TStringList;
@@ -301,12 +301,12 @@ begin
   try
     mensaje:=Socket.ReceiveText;
 
+    AgregaLogOG('R '+mensaje);
+
     if (Length(mensaje)=1) and (StrToIntDef(mensaje,-99) in [0,1]) then begin
-      AddPeticion(mensaje,'1',Socket);
+      AddPeticion('DISPENSERS|'+mensaje,'1',Socket);
       Exit;
     end;
-
-    AgregaLogOG('R '+mensaje);
 
     if (minutosLog>0) and (MinutesBetween(Now,horaLog)>=minutosLog) then begin
       GuardaLogOG;
@@ -363,46 +363,51 @@ var
   p:TPeticion;
 begin
   try
-    metodoEnum := TMetodos(GetEnumValue(TypeInfo(TMetodos), comando+'_e'));
+    try
+      metodoEnum := TMetodos(GetEnumValue(TypeInfo(TMetodos), comando+'_e'));
 
-    case metodoEnum of
-      STATE_e:
-        ResponderOG(ObtenerEstado,socket);
-      STATUS_e:
-        ResponderOG(ObtenerEstadoPosiciones(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
-      TRANSACTION_e:
-        ResponderOG(ObtenerTranPosCarga(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
-    else
-      if (comando<>cmdAnt) or (MilliSecondsBetween(Now, horaPeticion)>=5) then begin
-        inc(folio);
-        if folio>999 then
-          folio:=1;
+      case metodoEnum of
+        STATE_e:
+          ResponderOG(ObtenerEstado,socket);
+        STATUS_e:
+          ResponderOG(ObtenerEstadoPosiciones(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
+        TRANSACTION_e:
+          ResponderOG(ObtenerTranPosCarga(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
+      else
+        if (comando<>cmdAnt) or (MilliSecondsBetween(Now, horaPeticion)>=5) then begin
+          inc(folio);
+          if folio>999 then
+            folio:=1;
 
-        p:=TPeticion.Create;
-        p.Folio:=folio;
-        p.Comando:=comando;
-        p.Peticion:=valor;
-        p.CliSock:=socket;
-        p.HoraEnvio:=Now;
-        ListaPeticiones.Push(p);
-        cmdAnt:=comando;
-        horaPeticion:=Now;
+          p:=TPeticion.Create;
+          p.Folio:=folio;
+          p.Comando:=comando;
+          p.Peticion:=valor;
+          p.CliSock:=socket;
+          p.HoraEnvio:=Now;
+          ListaPeticiones.Push(p);
+          cmdAnt:=comando;
+          horaPeticion:=Now;
+        end;
+
+        if metodoEnum=PRICES_e then
+          ResponderOG('DISPENSERS|PRICES|True|0|', socket)
+        else if metodoEnum=AUTHORIZE_e then
+          ResponderOG('DISPENSERS|AUTHORIZE|True|0|', socket)
+        else if metodoEnum=PAYMENT_e then
+          ResponderOG('DISPENSERS|PAYMENT|True|0|', socket);
+
+        if metodoEnum=TRACE_e then begin
+          GuardaLogOG;
+          GuardaLogPDisp;
+        end;
       end;
-
-      if metodoEnum=PRICES_e then
-        ResponderOG('DISPENSERS|PRICES|True|0|', socket)
-      else if metodoEnum=AUTHORIZE_e then
-        ResponderOG('DISPENSERS|AUTHORIZE|True|0|', socket)
-      else if metodoEnum=PAYMENT_e then
-        ResponderOG('DISPENSERS|PAYMENT|True|0|', socket);
-
-      if metodoEnum=TRACE_e then begin
-        GuardaLogOG;
-        GuardaLogPDisp;                                       
-      end;
+    except
+      on e: Exception do
+        AgregaLogOG('Error AddPeticion [' + comando + ']: ' + e.Message);
     end;
   finally
-    if SecondsBetween(Now, horaAct)>=2 then begin
+    if SecondsBetween(Now, horaAct)>=10 then begin
       ListaPeticiones.Clear;
       SSocketOG.Active:=False;
     end;
@@ -603,8 +608,8 @@ begin
       Exit;
     end;
 
-    AgregaLogPDisp('E 0|NOTHING');
-    Socket.SendText('0|NOTHING');
+    AgregaLogPDisp('E 0|DISPENSERS|NOTHING');
+    Socket.SendText('0|DISPENSERS|NOTHING');
   except
     on e:Exception do begin
       AgregaLogPDisp('Error SSocketPDispClientRead: '+e.Message);

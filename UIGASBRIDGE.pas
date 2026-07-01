@@ -27,6 +27,9 @@ type
     folio:Integer;
     rootJSON: TlkJSONobject;
     horaAct, horaArranque, horaLog, horaPeticion: TDateTime;
+    horaUltimoDatoReal: TDateTime;       // hora de la ultima vez que Pdispensarios mando un JSON real (no PING)
+    TimeoutDatosObsoletos: Integer;      // segundos maximos sin dato real antes de considerar rootJSON obsoleto
+    datosObsoletosAvisados: Boolean;     // evita inundar el log con el mismo aviso de obsolescencia
     version:string;
     cmdAnt:string;
     minutosLog:Integer;
@@ -36,6 +39,7 @@ type
     procedure AgregaLogPDisp(lin: string);
     function CRC16(Data: string): string;
     procedure ResponderOG(resp: string; socket:TCustomWinSocket);
+    function DatosObsoletos(out segundos: Integer): Boolean;
     function ObtenerEstado:string;
     function ObtenerEstadoPosiciones(xpos:Integer):string;
     function ObtenerTranPosCarga(xpos:Integer):string;
@@ -261,6 +265,9 @@ begin
     SSocketPDisp.Port:=config.ReadInteger('CONF','PuertoPDisp',1004);
     minutosLog:=StrToInt(config.ReadString('CONF','MinutosLog','0'));
     TimeoutRespSrv:=config.ReadInteger('CONF','TimeoutRespSrv',2);
+    TimeoutDatosObsoletos:=config.ReadInteger('CONF','TimeoutDatosObsoletos',5);
+    horaUltimoDatoReal:=0;
+    datosObsoletosAvisados:=False;
     horaArranque:=Now;
     horaLog:=Now;
     version:='4941970710dc8f70c55306030d6c246851955fba';
@@ -294,7 +301,7 @@ end;
 procedure Togcvdispensarios_bridge.SSocketOGClientRead(
   Sender: TObject; Socket: TCustomWinSocket);
   var
-    mensaje,comando,checksum:string;
+    mensaje,comando,checksum,cabecera:string;
     i:Integer;
     chks_valido:Boolean;
 begin
@@ -332,14 +339,16 @@ begin
     if mensaje[Length(mensaje)]='|' then
       Delete(mensaje,Length(mensaje),1);
     if NoElemStrSep(mensaje,'|')>=2 then begin
-      if UpperCase(Copy(ExtraeElemStrSep(mensaje,1,'|'),1,10))<>'DISPENSERS' then begin
+      cabecera := Trim(UpperCase(ExtraeElemStrSep(mensaje,1,'|')));
+
+      if (cabecera <> 'DISPENSERS') and (cabecera <> 'DISPENSERSX') then begin
         ResponderOG('DISPENSERS|False|Este servicio solo procesa solicitudes de dispensarios|',Socket);
         Exit;
       end;
 
-      comando:=UpperCase(ExtraeElemStrSep(mensaje,2,'|'));
+      comando := Trim(UpperCase(ExtraeElemStrSep(mensaje,2,'|')));
 
-      if (not chks_valido) and (ExtraeElemStrSep(mensaje,1,'|')<>'DISPENSERSX') then begin
+      if (not chks_valido) and (cabecera <> 'DISPENSERSX') then begin
         ResponderOG('DISPENSERS|'+comando+'|False|Checksum invalido|',Socket);
         Exit;
       end;
@@ -485,14 +494,38 @@ begin
   end;
 end;
 
+function Togcvdispensarios_bridge.DatosObsoletos(out segundos: Integer): Boolean;
+begin
+  // No hay ningun snapshot todavia (recien arranco el servicio o el ultimo parseo fallo)
+  if (rootJSON = nil) or (horaUltimoDatoReal = 0) then begin
+    segundos := -1;
+    Result := True;
+    Exit;
+  end;
+
+  segundos := SecondsBetween(Now, horaUltimoDatoReal);
+  Result := segundos >= TimeoutDatosObsoletos;
+end;
+
 function Togcvdispensarios_bridge.ObtenerEstado:String;
 var
   n:TlkJSONbase;
+  segObsoleto:Integer;
 begin
   Result:='DISPENSERS|STATE|False|';
 
   if rootJSON = nil then
     Exit;
+
+  if DatosObsoletos(segObsoleto) then begin
+    if not datosObsoletosAvisados then begin
+      AgregaLogOG('AVISO: rootJSON obsoleto (sin dato real de Pdispensarios hace '+IntToStr(segObsoleto)+'s) - se reportara False hasta recibir datos nuevos');
+      AgregaLogPDisp('AVISO: rootJSON obsoleto (sin dato real de Pdispensarios hace '+IntToStr(segObsoleto)+'s) - se reportara False hasta recibir datos nuevos');
+      datosObsoletosAvisados:=True;
+    end;
+    Result:='DISPENSERS|STATE|False|Datos obsoletos, sin actualizacion de Pdispensarios desde hace '+IntToStr(segObsoleto)+'s|';
+    Exit;
+  end;
 
   n:=rootJSON.Field['Estado'];
 
@@ -509,12 +542,23 @@ var
   estadoNode  : TlkJSONbase;
   i           : Integer;
   AEstados    : string;
+  segObsoleto : Integer;
 begin
   try
     Result:='DISPENSERS|STATUS|False|';
 
     if rootJSON = nil then
       Exit;
+
+    if DatosObsoletos(segObsoleto) then begin
+      if not datosObsoletosAvisados then begin
+        AgregaLogOG('AVISO: rootJSON obsoleto (sin dato real de Pdispensarios hace '+IntToStr(segObsoleto)+'s) - se reportara False hasta recibir datos nuevos');
+        AgregaLogPDisp('AVISO: rootJSON obsoleto (sin dato real de Pdispensarios hace '+IntToStr(segObsoleto)+'s) - se reportara False hasta recibir datos nuevos');
+        datosObsoletosAvisados:=True;
+      end;
+      Result:='DISPENSERS|STATUS|False|Datos obsoletos, sin actualizacion de Pdispensarios desde hace '+IntToStr(segObsoleto)+'s|';
+      Exit;
+    end;
 
     posList := rootJSON.Field['PosCarga'] as TlkJSONlist;
     if posList = nil then
@@ -550,6 +594,7 @@ var
   posList     : TlkJSONlist;
   posObj      : TlkJSONobject;
   i           : Integer;
+  segObsoleto : Integer;
 
 begin
   Result:='DISPENSERS|TRANSACTION|False|';
@@ -559,6 +604,16 @@ begin
 
   if rootJSON = nil then
     Exit;
+
+  if DatosObsoletos(segObsoleto) then begin
+    if not datosObsoletosAvisados then begin
+      AgregaLogOG('AVISO: rootJSON obsoleto (sin dato real de Pdispensarios hace '+IntToStr(segObsoleto)+'s) - se reportara False hasta recibir datos nuevos');
+      AgregaLogPDisp('AVISO: rootJSON obsoleto (sin dato real de Pdispensarios hace '+IntToStr(segObsoleto)+'s) - se reportara False hasta recibir datos nuevos');
+      datosObsoletosAvisados:=True;
+    end;
+    Result:='DISPENSERS|TRANSACTION|False|Datos obsoletos, sin actualizacion de Pdispensarios desde hace '+IntToStr(segObsoleto)+'s|';
+    Exit;
+  end;
 
   posList := rootJSON.Field['PosCarga'] as TlkJSONlist;
   if posList = nil then
@@ -635,10 +690,40 @@ var
   i, folioResp  : Integer;
   Resultado : string;
   p : TPeticion;
+  nuevoJSON : TlkJSONobject;
 begin
+  // Se parsea primero a una variable temporal: si el JSON viene corrupto/incompleto
+  // se conserva el ultimo snapshot bueno en rootJSON en lugar de perderlo (quedaria nil).
+  try
+    nuevoJSON := TlkJSONobject(TlkJSON.ParseText(ATexto));
+  except
+    on e: Exception do begin
+      AgregaLogPDisp('Error parseando JSON de Pdispensarios (se conserva snapshot anterior): '+e.Message);
+      GuardaLogPDisp;
+      Exit;
+    end;
+  end;
+
+  if nuevoJSON = nil then begin
+    AgregaLogPDisp('Error: TlkJSON.ParseText devolvio nil (se conserva snapshot anterior)');
+    Exit;
+  end;
+
   if Assigned(rootJSON) then
     rootJSON.Free;
-  rootJSON := TlkJSONobject(TlkJSON.ParseText(ATexto));
+  rootJSON := nuevoJSON;
+
+  // Solo aqui, con un JSON real y bien formado ya instalado en rootJSON, se marca
+  // la hora del ultimo dato real. Los mensajes "PING" nunca llegan a esta funcion
+  // (se filtran en SSocketPDispClientRead), por lo que esta marca de tiempo refleja
+  // fielmente cuando Pdispensarios mando una lectura nueva de verdad.
+  horaUltimoDatoReal := Now;
+  if datosObsoletosAvisados then begin
+    AgregaLogOG('Pdispensarios volvio a enviar datos reales, se reanuda el reporte normal');
+    AgregaLogPDisp('Pdispensarios volvio a enviar datos reales, se reanuda el reporte normal');
+    datosObsoletosAvisados := False;
+  end;
+
   try
     jArray := rootJSON.Field['Peticiones'];
     if not (jArray is TlkJSONlist) then

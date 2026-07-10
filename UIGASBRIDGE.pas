@@ -30,6 +30,9 @@ type
     horaUltimoDatoReal: TDateTime;       // hora de la ultima vez que Pdispensarios mando un JSON real (no PING)
     TimeoutDatosObsoletos: Integer;      // segundos maximos sin dato real antes de considerar rootJSON obsoleto
     datosObsoletosAvisados: Boolean;     // evita inundar el log con el mismo aviso de obsolescencia
+    horaUltimoAutoKick: TDateTime;       // ultima vez que se forzo un TRACE automatico hacia Pdispensarios
+    AutoKickHabilitado: Boolean;         // activa/desactiva el auto-kick de recuperacion ante datos obsoletos
+    AutoKickIntervaloSeg: Integer;       // segundos minimos entre intentos de auto-kick
     version:string;
     cmdAnt:string;
     minutosLog:Integer;
@@ -40,6 +43,7 @@ type
     function CRC16(Data: string): string;
     procedure ResponderOG(resp: string; socket:TCustomWinSocket);
     function DatosObsoletos(out segundos: Integer): Boolean;
+    procedure IntentaRecuperarPDispensarios(segObsoleto: Integer);
     function ObtenerEstado:string;
     function ObtenerEstadoPosiciones(xpos:Integer):string;
     function ObtenerTranPosCarga(xpos:Integer):string;
@@ -266,7 +270,10 @@ begin
     minutosLog:=StrToInt(config.ReadString('CONF','MinutosLog','0'));
     TimeoutRespSrv:=config.ReadInteger('CONF','TimeoutRespSrv',2);
     TimeoutDatosObsoletos:=config.ReadInteger('CONF','TimeoutDatosObsoletos',5);
+    AutoKickHabilitado:=config.ReadInteger('CONF','AutoKickHabilitado',1)<>0;
+    AutoKickIntervaloSeg:=config.ReadInteger('CONF','AutoKickIntervaloSeg',3);
     horaUltimoDatoReal:=0;
+    horaUltimoAutoKick:=0;
     datosObsoletosAvisados:=False;
     horaArranque:=Now;
     horaLog:=Now;
@@ -507,6 +514,62 @@ begin
   Result := segundos >= TimeoutDatosObsoletos;
 end;
 
+{==============================================================================
+  IntentaRecuperarPDispensarios
+  =============================================================================
+  Caso detectado: al reiniciarse Pdispensarios (Wayne2W), este solo envia JSON
+  real una vez que procesa un comando entrante y hace "respJson:=True" (ver
+  AddPeticionJSON en Wayne2W). Mientras eso no ocurra, Pdispensarios se queda
+  enviando unicamente PING de forma indefinida, por lo que horaUltimoDatoReal
+  nunca se actualiza y DatosObsoletos se queda en True para siempre -aunque la
+  conexion este viva-, hasta que Opengas manda manualmente un comando (p.ej.
+  TRACE) que Pdispensarios procesa y con eso "despierta".
+
+  Esta funcion automatiza ese "empujon": si los datos llevan obsoletos y
+  Pdispensarios sigue vivo (nos sigue mandando PING), se encola internamente
+  un TRACE (sin socket de OG asociado) para forzar que Pdispensarios procese
+  un comando y reanude el envio de JSON real por su cuenta, sin depender de
+  que un operador lo note y lo dispare a mano desde Opengas.
+==============================================================================}
+procedure Togcvdispensarios_bridge.IntentaRecuperarPDispensarios(segObsoleto: Integer);
+var
+  p: TPeticion;
+begin
+  if not AutoKickHabilitado then
+    Exit;
+
+  // Solo tiene caso "despertar" a Pdispensarios si sigue conectado y pineando;
+  // si ya no hay comunicacion en absoluto, no hay nada que forzar desde aqui.
+  if SecondsBetween(Now, horaAct) >= 10 then
+    Exit;
+
+  // Throttle: no inundar la cola con TRACEs repetidos mientras se resuelve.
+  if (horaUltimoAutoKick <> 0) and (SecondsBetween(Now, horaUltimoAutoKick) < AutoKickIntervaloSeg) then
+    Exit;
+
+  try
+    inc(folio);
+    if folio > 999 then
+      folio := 1;
+
+    p := TPeticion.Create;
+    p.Folio     := folio;
+    p.Comando   := 'TRACE';
+    p.Peticion  := 'DISPENSERS|TRACE|';
+    p.CliSock   := nil;   // no hay socket de Opengas real detras de este comando
+    p.HoraEnvio := Now;
+    ListaPeticiones.Push(p);
+
+    horaUltimoAutoKick := Now;
+
+    AgregaLogOG('AVISO: TRACE automatico enviado a Pdispensarios (obsoleto desde hace '+IntToStr(segObsoleto)+'s) para forzar reanudacion de datos reales');
+    AgregaLogPDisp('AVISO: TRACE automatico enviado a Pdispensarios (obsoleto desde hace '+IntToStr(segObsoleto)+'s) para forzar reanudacion de datos reales');
+  except
+    on e: Exception do
+      AgregaLogOG('Error IntentaRecuperarPDispensarios: '+e.Message);
+  end;
+end;
+
 function Togcvdispensarios_bridge.ObtenerEstado:String;
 var
   n:TlkJSONbase;
@@ -738,10 +801,12 @@ begin
 
       if ListaPeticiones.TryLocateByFolio(folioResp, p) then
       begin
-        if p.Comando='1' then
-          ResponderOG(Resultado, p.CliSock)
-        else
-          ResponderOG('DISPENSERS|' + p.Comando + '|' + Resultado, p.CliSock);
+        if Assigned(p.CliSock) then begin
+          if p.Comando='1' then
+            ResponderOG(Resultado, p.CliSock)
+          else
+            ResponderOG('DISPENSERS|' + p.Comando + '|' + Resultado, p.CliSock);
+        end;
         ListaPeticiones.Remove(p);
       end;
 
@@ -771,6 +836,7 @@ end;
 procedure Togcvdispensarios_bridge.TimerTimeoutTimer(Sender: TObject);
 var
   p: TPeticion;
+  segObsoleto: Integer;
 begin
   try
     while ListaPeticiones.TryPopExpired(TimeoutRespSrv, p) do begin
@@ -779,16 +845,21 @@ begin
       AgregaLogPDisp('TIMEOUT [' + IntToStr(p.Folio) + ']: '
         + p.Comando + ' - ' + IntToStr(TimeoutRespSrv) + 's sin respuesta de Wayne2W');
       try
-        if p.Comando = '1' then
-          ResponderOG('False|Timeout excedido con Pdispensarios|', p.CliSock)
-        else
-          ResponderOG('DISPENSERS|' + p.Comando + '|False|Timeout excedido con Pdispensarios|', p.CliSock);
+        if Assigned(p.CliSock) then begin
+          if p.Comando = '1' then
+            ResponderOG('False|Timeout excedido con Pdispensarios|', p.CliSock)
+          else
+            ResponderOG('DISPENSERS|' + p.Comando + '|False|Timeout excedido con Pdispensarios|', p.CliSock);
+        end;
       except
         on e: Exception do
           AgregaLogPDisp('Error respondiendo timeout: ' + e.Message);
       end;
       p.Free;
     end;
+
+    if DatosObsoletos(segObsoleto) then
+      IntentaRecuperarPDispensarios(segObsoleto);
   except
     on e: Exception do
       AgregaLogPDisp('Error TimerTimeoutTimer: ' + e.Message);

@@ -61,7 +61,7 @@ type
     Folio    : Integer;
     Comando  : string;
     Peticion : string;
-    Tries    : Integer;
+    Enviada  : Boolean;
     CliSock  : TCustomWinSocket;
     HoraEnvio: TDateTime;
   end;
@@ -76,10 +76,8 @@ type
     destructor  Destroy; override;
 
     procedure  Push(APeticion: TPeticion);
-    function  TryPeek(out APeticion: TPeticion): Boolean;
-    function TryLocateByFolio(AFol: Integer; out APet: TPeticion): Boolean;
-    function TryLocateByTipo(ATipo: string; out APet: TPeticion): Boolean;
-    procedure Remove(APeticion: TPeticion; AFree: Boolean = True);
+    function  TryStartNext(out APeticion: TPeticion): Boolean;
+    function  TryPopByFolio(AFol: Integer; out APeticion: TPeticion): Boolean;
     function  TryPopExpired(TimeoutSeg: Integer; out APeticion: TPeticion): Boolean;
     function  TryPop(out APeticion: TPeticion): Boolean;
     procedure Clear;
@@ -120,7 +118,7 @@ begin
   end;
 end;
 
-function TPeticionQueue.TryPeek(out APeticion: TPeticion): Boolean;
+function TPeticionQueue.TryStartNext(out APeticion: TPeticion): Boolean;
 begin
   APeticion := nil;
   Result := False;
@@ -128,8 +126,9 @@ begin
   try
     if FList.Count > 0 then begin
       APeticion := TPeticion(FList[0]);
-      if APeticion.Tries = 0 then begin
-        Inc(APeticion.Tries);
+      if not APeticion.Enviada then begin
+        APeticion.Enviada := True;
+        APeticion.HoraEnvio := Now;
         Result := True;
       end
       else
@@ -140,62 +139,24 @@ begin
   end;
 end;
 
-function TPeticionQueue.TryLocateByFolio(AFol: Integer; out APet: TPeticion): Boolean;
+function TPeticionQueue.TryPopByFolio(AFol: Integer;
+  out APeticion: TPeticion): Boolean;
 var
   i: Integer;
 begin
-  APet := nil;
+  APeticion := nil;
+  Result := False;
   EnterCriticalSection(FCS);
   try
     for i := 0 to FList.Count - 1 do
-      if TPeticion(FList[i]).Folio = AFol then
+      if (TPeticion(FList[i]).Folio = AFol) and
+         TPeticion(FList[i]).Enviada then
       begin
-        APet  := TPeticion(FList[i]);
+        APeticion := TPeticion(FList[i]);
+        FList.Delete(i);
         Result := True;
         Exit;
       end;
-    Result := False;
-  finally
-    LeaveCriticalSection(FCS);
-  end;
-end;
-
-function TPeticionQueue.TryLocateByTipo(ATipo: string; out APet: TPeticion): Boolean;
-var
-  i: Integer;
-begin
-  APet := nil;
-  EnterCriticalSection(FCS);
-  try
-    for i := 0 to FList.Count - 1 do
-      if (TPeticion(FList[i]).Comando = ATipo) and (TPeticion(FList[i]).Tries>0) then
-      begin
-        APet  := TPeticion(FList[i]);
-        Result := True;
-        Exit;
-      end;
-    Result := False;
-  finally
-    LeaveCriticalSection(FCS);
-  end;
-end;
-
-procedure TPeticionQueue.Remove(APeticion: TPeticion; AFree: Boolean = True);
-var
-  Idx : Integer;
-begin
-  if APeticion = nil then
-    Exit;
-
-  EnterCriticalSection(FCS);
-  try
-    Idx := FList.IndexOf(APeticion);
-    if Idx <> -1 then
-    begin
-      FList.Delete(Idx);
-      if AFree then
-        APeticion.Free;
-    end;
   finally
     LeaveCriticalSection(FCS);
   end;
@@ -227,7 +188,8 @@ begin
   try
     if FList.Count > 0 then begin
       Tmp := TPeticion(FList[0]);
-      if (SecondsBetween(Now, Tmp.HoraEnvio) >= TimeoutSeg) then
+      if Tmp.Enviada and (Tmp.HoraEnvio > 0) and
+         (SecondsBetween(Now, Tmp.HoraEnvio) >= TimeoutSeg) then
       begin
         FList.Delete(0);
         APeticion := Tmp;
@@ -413,7 +375,9 @@ begin
         p.CliSock:=nil // estos comandos ya reciben confirmacion inmediata
       else
         p.CliSock:=socket;
-      p.HoraEnvio:=Now;
+      // El timeout comienza cuando la peticion se envia a Pdispensarios.
+      p.Enviada:=False;
+      p.HoraEnvio:=0;
       ListaPeticiones.Push(p);
       p:=nil; // la cola es propietaria de la peticion desde este punto
       cmdAnt:=comando;
@@ -601,7 +565,8 @@ begin
     p.Comando   := 'TRACE';
     p.Peticion  := 'DISPENSERS|TRACE|';
     p.CliSock   := nil;   // no hay socket de Opengas real detras de este comando
-    p.HoraEnvio := Now;
+    p.Enviada   := False;
+    p.HoraEnvio := 0;
     ListaPeticiones.Push(p);
 
     horaUltimoAutoKick := Now;
@@ -764,7 +729,7 @@ begin
     if not AnsiContainsText(respTxt,'PING') then
       ProcesaRespuestasJSON(respTxt);
 
-    if ListaPeticiones.TryPeek(p) then begin
+    if ListaPeticiones.TryStartNext(p) then begin
       AgregaLogPDisp('E '+IntToStr(p.Folio)+'|'+p.Peticion);
       Socket.SendText(IntToStr(p.Folio)+'|'+p.Peticion);
       Exit;
@@ -843,23 +808,19 @@ begin
       folioResp     := jItem.Field['Folio'].Value;
       Resultado := jItem.Field['Resultado'].Value;
 
-      if ListaPeticiones.TryLocateByFolio(folioResp, p) then
+      if ListaPeticiones.TryPopByFolio(folioResp, p) then
       begin
-        if Assigned(p.CliSock) then begin
-          if p.Comando='1' then
-            ResponderOG(Resultado, p.CliSock)
-          else
-            ResponderOG('DISPENSERS|' + p.Comando + '|' + Resultado, p.CliSock);
+        try
+          if Assigned(p.CliSock) then begin
+            if p.Comando='1' then
+              ResponderOG(Resultado, p.CliSock)
+            else
+              ResponderOG('DISPENSERS|' + p.Comando + '|' + Resultado, p.CliSock);
+          end;
+        finally
+          p.Free;
         end;
-        ListaPeticiones.Remove(p);
       end;
-
-      if ListaPeticiones.TryLocateByTipo('PRICES', p) then
-        ListaPeticiones.Remove(p);
-      if ListaPeticiones.TryLocateByTipo('AUTHORIZE', p) then
-        ListaPeticiones.Remove(p);
-      if ListaPeticiones.TryLocateByTipo('PAYMENT', p) then
-        ListaPeticiones.Remove(p);
     end;
   except
     on e:Exception do begin

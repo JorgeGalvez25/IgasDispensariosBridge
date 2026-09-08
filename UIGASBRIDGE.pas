@@ -50,6 +50,7 @@ type
     procedure GuardaLogOG;
     procedure GuardaLogPDisp;
     procedure ProcesaRespuestasJSON(const ATexto: string);
+    procedure CancelarPeticiones(const AMotivo: string);
     { Public declarations }
   end;
 
@@ -75,12 +76,12 @@ type
     destructor  Destroy; override;
 
     procedure  Push(APeticion: TPeticion);
-    function  TryPeek(out APeticion: TPeticion;
-                      MaxTries: Integer = 3): Boolean;
+    function  TryPeek(out APeticion: TPeticion): Boolean;
     function TryLocateByFolio(AFol: Integer; out APet: TPeticion): Boolean;
     function TryLocateByTipo(ATipo: string; out APet: TPeticion): Boolean;
     procedure Remove(APeticion: TPeticion; AFree: Boolean = True);
     function  TryPopExpired(TimeoutSeg: Integer; out APeticion: TPeticion): Boolean;
+    function  TryPop(out APeticion: TPeticion): Boolean;
     procedure Clear;
   end;
 
@@ -103,6 +104,7 @@ end;
 
 destructor TPeticionQueue.Destroy;
 begin
+  Clear;
   DeleteCriticalSection(FCS);
   FList.Free;
   inherited;
@@ -118,32 +120,21 @@ begin
   end;
 end;
 
-function TPeticionQueue.TryPeek(out APeticion: TPeticion;
-                                MaxTries: Integer = 3): Boolean;
-var
-  Tmp : TPeticion;
+function TPeticionQueue.TryPeek(out APeticion: TPeticion): Boolean;
 begin
   APeticion := nil;
+  Result := False;
   EnterCriticalSection(FCS);
   try
-    while FList.Count > 0 do
-    begin
-      Tmp := TPeticion(FList[0]);
-      Inc(Tmp.Tries);
-
-      if Tmp.Tries >= MaxTries then
-      begin
-        FList.Delete(0);
-        Tmp.Free;
-        Continue;
-      end;
-
-      APeticion := Tmp;
-      Result    := True;
-      Exit;
+    if FList.Count > 0 then begin
+      APeticion := TPeticion(FList[0]);
+      if APeticion.Tries = 0 then begin
+        Inc(APeticion.Tries);
+        Result := True;
+      end
+      else
+        APeticion := nil;
     end;
-
-    Result := False;
   finally
     LeaveCriticalSection(FCS);
   end;
@@ -248,6 +239,23 @@ begin
   end;
 end;
 
+function TPeticionQueue.TryPop(out APeticion: TPeticion): Boolean;
+begin
+  APeticion := nil;
+  Result := False;
+
+  EnterCriticalSection(FCS);
+  try
+    if FList.Count > 0 then begin
+      APeticion := TPeticion(FList[0]);
+      FList.Delete(0);
+      Result := True;
+    end;
+  finally
+    LeaveCriticalSection(FCS);
+  end;
+end;
+
 procedure ServiceController(CtrlCode: DWord); stdcall;
 begin
   ogcvdispensarios_bridge.Controller(CtrlCode);
@@ -269,6 +277,8 @@ begin
     SSocketPDisp.Port:=config.ReadInteger('CONF','PuertoPDisp',1004);
     minutosLog:=StrToInt(config.ReadString('CONF','MinutosLog','0'));
     TimeoutRespSrv:=config.ReadInteger('CONF','TimeoutRespSrv',2);
+    if TimeoutRespSrv<=0 then
+      TimeoutRespSrv:=2;
     TimeoutDatosObsoletos:=config.ReadInteger('CONF','TimeoutDatosObsoletos',5);
     AutoKickHabilitado:=config.ReadInteger('CONF','AutoKickHabilitado',1)<>0;
     AutoKickIntervaloSeg:=config.ReadInteger('CONF','AutoKickIntervaloSeg',3);
@@ -295,6 +305,7 @@ begin
       ServiceThread.ProcessRequests(True);
     TimerTimeout.Enabled:=False;
     TimerTimeout.Free;
+    CancelarPeticiones('Bridge detenido');
     SSocketOG.Active := False;
     SSocketPDisp.Active := False;
   except
@@ -378,54 +389,87 @@ var
   metodoEnum:TMetodos;
   p:TPeticion;
 begin
+  p:=nil;
   try
-    try
-      metodoEnum := TMetodos(GetEnumValue(TypeInfo(TMetodos), comando+'_e'));
+    metodoEnum := TMetodos(GetEnumValue(TypeInfo(TMetodos), comando+'_e'));
 
-      case metodoEnum of
-        STATE_e:
-          ResponderOG(ObtenerEstado,socket);
-        STATUS_e:
-          ResponderOG(ObtenerEstadoPosiciones(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
-        TRANSACTION_e:
-          ResponderOG(ObtenerTranPosCarga(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
+    case metodoEnum of
+      STATE_e:
+        ResponderOG(ObtenerEstado,socket);
+      STATUS_e:
+        ResponderOG(ObtenerEstadoPosiciones(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
+      TRANSACTION_e:
+        ResponderOG(ObtenerTranPosCarga(StrToIntDef(ExtraeElemStrSep(valor,3,'|'),0)),socket);
+    else
+      inc(folio);
+      if folio>999 then
+        folio:=1;
+
+      p:=TPeticion.Create;
+      p.Folio:=folio;
+      p.Comando:=comando;
+      p.Peticion:=valor;
+      if metodoEnum in [PRICES_e, AUTHORIZE_e, PAYMENT_e] then
+        p.CliSock:=nil // estos comandos ya reciben confirmacion inmediata
       else
-        if (comando<>cmdAnt) or (MilliSecondsBetween(Now, horaPeticion)>=5) then begin
-          inc(folio);
-          if folio>999 then
-            folio:=1;
+        p.CliSock:=socket;
+      p.HoraEnvio:=Now;
+      ListaPeticiones.Push(p);
+      p:=nil; // la cola es propietaria de la peticion desde este punto
+      cmdAnt:=comando;
+      horaPeticion:=Now;
 
-          p:=TPeticion.Create;
-          p.Folio:=folio;
-          p.Comando:=comando;
-          p.Peticion:=valor;
-          p.CliSock:=socket;
-          p.HoraEnvio:=Now;
-          ListaPeticiones.Push(p);
-          cmdAnt:=comando;
-          horaPeticion:=Now;
-        end;
+      if metodoEnum=PRICES_e then
+        ResponderOG('DISPENSERS|PRICES|True|0|', socket)
+      else if metodoEnum=AUTHORIZE_e then
+        ResponderOG('DISPENSERS|AUTHORIZE|True|0|', socket)
+      else if metodoEnum=PAYMENT_e then
+        ResponderOG('DISPENSERS|PAYMENT|True|0|', socket);
 
-        if metodoEnum=PRICES_e then
-          ResponderOG('DISPENSERS|PRICES|True|0|', socket)
-        else if metodoEnum=AUTHORIZE_e then
-          ResponderOG('DISPENSERS|AUTHORIZE|True|0|', socket)
-        else if metodoEnum=PAYMENT_e then
-          ResponderOG('DISPENSERS|PAYMENT|True|0|', socket);
-
-        if metodoEnum=TRACE_e then begin
+      if metodoEnum=TRACE_e then
+        try
           GuardaLogOG;
           GuardaLogPDisp;
+        except
+          on e: Exception do
+            AgregaLogOG('Error guardando logs de TRACE: ' + e.Message);
         end;
-      end;
-    except
-      on e: Exception do
-        AgregaLogOG('Error AddPeticion [' + comando + ']: ' + e.Message);
     end;
-  finally
-    if SecondsBetween(Now, horaAct)>=10 then begin
-      ListaPeticiones.Clear;
-      SSocketOG.Active:=False;
+  except
+    on e: Exception do begin
+      if Assigned(p) then
+        p.Free;
+      AgregaLogOG('Error AddPeticion [' + comando + ']: ' + e.Message);
+      ResponderOG('DISPENSERS|' + comando + '|False|Error interno del Bridge: ' + e.Message + '|', socket);
+    end;
+  end;
+
+  if SecondsBetween(Now, horaAct)>=10 then begin
+    CancelarPeticiones('Pdispensarios sin actividad');
+    SSocketOG.Active:=False;
+  end;
+end;
+
+procedure Togcvdispensarios_bridge.CancelarPeticiones(const AMotivo: string);
+var
+  p: TPeticion;
+begin
+  while ListaPeticiones.TryPop(p) do begin
+    try
+      try
+        AgregaLogOG('CANCELA [' + IntToStr(p.Folio) + ']: ' + p.Comando + ' - ' + AMotivo);
+        AgregaLogPDisp('CANCELA [' + IntToStr(p.Folio) + ']: ' + p.Comando + ' - ' + AMotivo);
+      except
+        // Un fallo de bitacora no debe impedir la respuesta al solicitante.
+      end;
+      if Assigned(p.CliSock) then begin
+        if p.Comando = '1' then
+          ResponderOG('False|' + AMotivo + '|', p.CliSock)
+        else
+          ResponderOG('DISPENSERS|' + p.Comando + '|False|' + AMotivo + '|', p.CliSock);
+      end;
+    finally
+      p.Free;
     end;
   end;
 end;
@@ -840,22 +884,24 @@ var
 begin
   try
     while ListaPeticiones.TryPopExpired(TimeoutRespSrv, p) do begin
-      AgregaLogOG('TIMEOUT [' + IntToStr(p.Folio) + ']: '
-        + p.Comando + ' - ' + IntToStr(TimeoutRespSrv) + 's sin respuesta de Wayne2W');
-      AgregaLogPDisp('TIMEOUT [' + IntToStr(p.Folio) + ']: '
-        + p.Comando + ' - ' + IntToStr(TimeoutRespSrv) + 's sin respuesta de Wayne2W');
       try
+        try
+          AgregaLogOG('TIMEOUT [' + IntToStr(p.Folio) + ']: '
+            + p.Comando + ' - ' + IntToStr(TimeoutRespSrv) + 's sin respuesta de Pdispensarios');
+          AgregaLogPDisp('TIMEOUT [' + IntToStr(p.Folio) + ']: '
+            + p.Comando + ' - ' + IntToStr(TimeoutRespSrv) + 's sin respuesta de Pdispensarios');
+        except
+          // Un fallo de bitacora no debe impedir la respuesta al solicitante.
+        end;
         if Assigned(p.CliSock) then begin
           if p.Comando = '1' then
             ResponderOG('False|Timeout excedido con Pdispensarios|', p.CliSock)
           else
             ResponderOG('DISPENSERS|' + p.Comando + '|False|Timeout excedido con Pdispensarios|', p.CliSock);
         end;
-      except
-        on e: Exception do
-          AgregaLogPDisp('Error respondiendo timeout: ' + e.Message);
+      finally
+        p.Free;
       end;
-      p.Free;
     end;
 
     if DatosObsoletos(segObsoleto) then
